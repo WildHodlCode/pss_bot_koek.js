@@ -3,3 +3,7 @@ export type TodoDocument = {
     entries: Record<string, string>
     needed: number
 }
+
+export type UnarchiveDocument = {
+    _id: string
+}
