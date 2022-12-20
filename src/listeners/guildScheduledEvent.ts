@@ -1,10 +1,15 @@
-import { Colors, GuildScheduledEvent, User } from "discord.js";
+import { APIEmbed, APIEmbedField, Colors, GuildScheduledEvent, GuildScheduledEventStatus, time, User } from "discord.js";
+import { capitalCase } from "capital-case";
 
 const minute = 1000 * 60;
 
 type GuildScheduledEventReminder = {
     event: GuildScheduledEvent
     timeouts: NodeJS.Timeout[]
+}
+
+type KeyOfType<T, V> = keyof {
+    [P in keyof T as T[P] extends V ? P : never]: any
 }
 
 const reminders: Record<string, GuildScheduledEventReminder | undefined> = {};
@@ -176,6 +181,53 @@ const remindForTime = (eventTime: number, scheduledEvent: GuildScheduledEvent) =
     return timeouts;
 }
 
+const logEvent = async (scheduledEvent: GuildScheduledEvent, embed: APIEmbed) => {
+    const guild = await scheduledEvent.client.guilds.fetch(scheduledEvent.guildId);
+    const channel = await guild.channels.fetch(process.env.LOG_EVENT_CHANNEL!)
+    if (channel && channel.isTextBased()) {
+        channel.send({
+            embeds: [embed]
+        });
+    }
+}
+
+const getPropertyUpdates = (oldScheduledEvent: GuildScheduledEvent, newScheduledEvent: GuildScheduledEvent) => {
+    const before: string[] = [];
+    const after: string[] = [];
+
+    const addField = (label: string, old: string | null | undefined, current: string | null | undefined) => {
+        if (old !== current) {
+            before.push(`\n**${capitalCase(label)}**\n${old || ""}`);
+            after.push(`\n**${capitalCase(label)}**\n${current || ""}`);
+        }
+    }
+
+    addField("Location", oldScheduledEvent.entityMetadata?.location, newScheduledEvent.entityMetadata?.location);
+
+    (["scheduledStartAt", "scheduledEndAt"] as KeyOfType<GuildScheduledEvent, Date | null>[])
+        .forEach(prop => addField(prop.substring(9), time(oldScheduledEvent[prop]!), time(newScheduledEvent[prop]!)));
+
+    (["name", "description"] as KeyOfType<GuildScheduledEvent, string | null>[])
+        .forEach(prop => addField(prop, oldScheduledEvent[prop], newScheduledEvent[prop]));
+
+    addField("Image", oldScheduledEvent.coverImageURL(), newScheduledEvent.coverImageURL());
+
+    return before.length == 0
+        ? undefined
+        : [
+            {
+                name: "BEFORE",
+                value: before.join("\n"),
+                inline: true
+            },
+            {
+                name: "AFTER",
+                value: after.join("\n"),
+                inline: true
+            }
+        ];
+}
+
 export const onGuildScheduledEvent = async (scheduledEvent: GuildScheduledEvent) => {
     removeReminder(scheduledEvent.id);
 
@@ -209,14 +261,83 @@ export const onGuildScheduledEventCreate = async (scheduledEvent: GuildScheduled
     }
 
     pings[scheduledEvent.id] = setTimeout(pingInChannel, delay, scheduledEvent, process.env.NEW_EVENT_CHANNEL!, true);
+
+    const fields = (["scheduledStartAt", "scheduledEndAt"] as KeyOfType<GuildScheduledEvent, Date | null>[])
+        .map(prop => {
+            return {
+                name: capitalCase(prop.substring(9)),
+                value: time(scheduledEvent[prop]!),
+                inline: true
+            };
+        });
+
+    logEvent(scheduledEvent, {
+        color: Colors.Blue,
+        description: `**Event Created:** ${scheduledEvent.name}`,
+        fields,
+        footer: { text: `ID: ${scheduledEvent.id}` }
+    });
 }
 
 export const onGuildScheduledEventDelete = async (scheduledEvent: GuildScheduledEvent) => {
     removePing(scheduledEvent.id);
     removeReminder(scheduledEvent.id);
+
+    const fields = (["scheduledStartAt", "scheduledEndAt"] as KeyOfType<GuildScheduledEvent, Date | null>[])
+        .map(prop => {
+            return {
+                name: capitalCase(prop.substring(9)),
+                value: time(scheduledEvent[prop]!),
+                inline: true
+            };
+        });
+
+    logEvent(scheduledEvent, {
+        color: Colors.Blue,
+        description: `**Event Canceled:** ${scheduledEvent.name}`,
+        fields,
+        footer: { text: `ID: ${scheduledEvent.id}` }
+    });
 }
 
-export const onGuildScheduledEventUpdate = async (_: GuildScheduledEvent | null, newScheduledEvent: GuildScheduledEvent) => onGuildScheduledEvent(newScheduledEvent);
+export const onGuildScheduledEventUpdate = async (oldScheduledEvent: GuildScheduledEvent | null, newScheduledEvent: GuildScheduledEvent) => {
+    onGuildScheduledEvent(newScheduledEvent);
+
+    switch (newScheduledEvent.status) {
+        case GuildScheduledEventStatus.Active:
+            {
+                const body = newScheduledEvent.scheduledEndAt?.valueOf() || 0 > Date.now() ? "Event started ahead of scheduled time" : "";
+                logEvent(newScheduledEvent, {
+                    color: Colors.Blue,
+                    description: `**Event Started:** ${newScheduledEvent.name}\n\n${body}`,
+                    footer: { text: `ID: ${newScheduledEvent.id}` }
+                });
+            }
+            break;
+        case GuildScheduledEventStatus.Completed:
+            {
+                const body = newScheduledEvent.scheduledEndAt?.valueOf() || 0 > Date.now() ? "Event ended ahead of scheduled time" : "";
+                logEvent(newScheduledEvent, {
+                    color: Colors.Blue,
+                    description: `**Event Finished:** ${newScheduledEvent.name}\n\n${body}`,
+                    footer: { text: `ID: ${newScheduledEvent.id}` }
+                });
+            }
+            break;
+        case GuildScheduledEventStatus.Scheduled:
+            if (!oldScheduledEvent) {
+                return;
+            }
+
+            logEvent(newScheduledEvent, {
+                color: Colors.Blue,
+                description: `**Event Updated:** ${newScheduledEvent.name}`,
+                footer: { text: `ID: ${newScheduledEvent.id}` },
+                fields: getPropertyUpdates(oldScheduledEvent, newScheduledEvent)
+            });
+            break;
+    }
+};
 
 export const onGuildScheduledEventUserAdd = async (scheduledEvent: GuildScheduledEvent, user: User) => {
     if (!scheduledEvent.scheduledStartAt) {
